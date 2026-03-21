@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python test_api.py)",
+      "Bash(pip install:*)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(.venv/bin/python test_api.py)",
+      "Bash(.venv/bin/python debug_ali.py)",
+      "Bash(.venv/bin/python probe_gemini.py)",
+      "Bash(.venv/bin/python find_working_model.py 2>&1)"
+    ]
+  }
+}

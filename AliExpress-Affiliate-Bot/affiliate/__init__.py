@@ -1,0 +1,1 @@
+# affiliate — Affiliate link generation

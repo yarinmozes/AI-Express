@@ -1,219 +1,387 @@
 """
-engine.py — LLM evaluation engine with Hallucination Guard.
+engine.py — Trust-First product scoring, LLM selection, and query utilities.
 
-Responsibilities:
-- Build the system prompt instructing the LLM to output strict JSON only
-- Enforce the Hallucination Guard: validate every recommended product exists in the input data
-- Select top 3 products: Cheapest, Best Reviewed, Best Value (Balanced)
-- Support multiple backends: Gemini Flash (primary), Claude Haiku (fallback)
-  Backend selected via LLM_PROVIDER env var.
+ARCHITECTURE — TRUST-FIRST SCORING PIPELINE:
+  1. translate_to_english()         — Hebrew → SearchPlan + strategy
+  2. search_aliexpress_multi()      — Brand RATING axes + category VOLUME axis
+  3. select_and_rank_products()     — Score → Top-10 → LLM selects 3 → Python labels
+     a. _prune_items()              — extract fields from raw API response
+     b. _deduplicate_by_product()   — remove near-identical listings
+     c. _run_confidence_scoring()   — 4-component score per item (0–100)
+     d. _llm_select_products()      — LLM picks 3 IDs from top-10, writes Hebrew reasons
+     e. _assign_labels_and_format() — Python assigns cheapest/best_rated/best_value
 
-HALLUCINATION GUARD RULE:
-  After receiving the LLM response, verify each recommended product's item_id exists in the
-  original pruned input. Discard and log any product not found. Never surface
-  a hallucinated product to the user.
+Scoring components (0–100 total):
+  price_score    (0–30): price within the translator's price_window_ils
+  seller_score   (0–30): official store, rating depth, sales depth
+  hint_score     (0–30): confidence_hints matched in the product title
+  integrity_score (0–10): no zero-price, no variant-trap bait pricing
+
+LLM CALLS (this module):
+  - _llm_select_products() — picks 3 item IDs from top-10 + Hebrew reasons
+  - should_clarify_query() — detect vague queries, emit Hebrew clarifying questions
+  - refine_query()         — merge clarification answers → refined SearchPlan
+
+Debug logging: every search writes search_debug_<timestamp>.json capturing the full
+score breakdown, top-10 sent to LLM, and final output.
+
+Model: gemini-3.1-flash-lite-preview (free tier, ~30 RPM).
+Transient 429s are retried by _gemini_generate() with exponential backoff (max 3 attempts).
 """
 
+import asyncio
+import datetime
 import json
 import logging
+import math
 import os
 import re
+from dataclasses import dataclass
 
-from groq import AsyncGroq
+from google import genai
+from google.genai import types
+
+from utils.translator import SearchPlan, merge_search_plans
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "llama-3.3-70b-versatile"
+_MODEL = "gemini-3.1-flash-lite-preview"
+_MAX_ITEMS   = 60   # cap items fed into scoring
+_TOP_N_LLM   = 10   # items shown to LLM for selection
+_SELECT_COUNT = 3   # items LLM must select
 
-# Send up to this many items in the LLM prompt to avoid token overuse.
-_MAX_ITEMS_FOR_LLM = 20
-
-# Maps LLM category keys → Hebrew display labels.
-CATEGORY_LABELS: dict[str, str] = {
-    "cheapest": "הזול ביותר 💰",
+_CATEGORY_LABELS: dict[str, str] = {
+    "cheapest":   "הזול ביותר 💰",
     "best_rated": "המדורג הגבוה ביותר ⭐",
     "best_value": "הבחירה המאוזנת ✅",
 }
 
-_SYSTEM_PROMPT = """You are an expert personal shopping analyst for Israeli shoppers on AliExpress.
-
-You will receive a JSON list of products and the user's search intent.
-Your job: select exactly 3 products that best match what the user truly needs.
-
-══════════════════════════════════════════════════════════
-INTERNAL ANALYSIS — complete all phases before producing output
-══════════════════════════════════════════════════════════
-
-── PHASE 0: INTENT PARSING ───────────────────────────────
-Extract two signals from the user query before any other analysis.
-
-  SIGNAL A — FORM FACTOR (internal label: FORM_FACTOR_HARD_SPECS):
-  Identify every physical form-factor or product-type boundary term in the query.
-  Use these term classes as a reference:
-    Audio:    over-ear / on-ear / in-ear / IEM / TWS / earbud / canal / open-back
-    Cases:    case / cover / bumper / screen protector / tempered glass / film /
-              stand / holder / mount
-    Cables:   cable / hub / dock / adapter / converter / splitter
-    Bags:     backpack / messenger / tote / clutch / wallet / crossbody
-    Seating:  chair / stool / cushion / armrest
-    Displays: monitor / portable display / touchscreen
-  Every form-factor term you identify is automatically a HARD spec.
-  Carry this list forward as FORM_FACTOR_HARD_SPECS into Phase 1 and Phase 2.
-
-  SIGNAL B — QUALITY/BUDGET INTENT (internal label: QUALITY_INTENT):
-  Classify the user's intent on this three-level scale:
-    PREMIUM  — signals: "premium", "high quality", "high budget", "professional",
-               "durable", "best", "flagship", "luxury", "מובחר", "איכותי", "יקר"
-    BUDGET   — signals: "cheap", "affordable", "budget", "cheapest", "זול", "תקציבי"
-    STANDARD — no explicit quality or budget signal (default)
-  Carry this forward as QUALITY_INTENT into Phase 3.
-
-── PHASE 1: SPEC EXTRACTION ──────────────────────────────
-Read the user query and extract every explicit technical requirement.
-Classify each as:
-  HARD — measurable, binary, non-negotiable constraints:
-         port counts ("4 Type-C ports"), wattage ("100W"), specific features
-         ("ANC", "IPX7", "2.4GHz + 5GHz"), exact dimensions, specific standards.
-         NOTE: All FORM_FACTOR_HARD_SPECS from Phase 0 are already HARD — include
-         them in the HARD list without re-classifying them.
-  SOFT — preferences where a close match is acceptable:
-         "lightweight", "compact", "good battery life", "fast charging".
-
-If the query contains no explicit technical specs beyond form factor, the HARD list
-contains only FORM_FACTOR_HARD_SPECS and you proceed directly to Phase 2.
-
-── PHASE 2: COMPLIANCE FILTER ────────────────────────────
-For each product, cross-reference its title against every HARD requirement:
-  PASS      — title provides clear evidence the spec IS met
-  FAIL      — title clearly contradicts the spec
-  UNCERTAIN — title is silent on the spec (product might meet it, but no proof)
-
-FORM-FACTOR CLAUSE (absolute, no exceptions):
-  A product whose title indicates a DIFFERENT form factor than requested → FAIL.
-  A product whose title does not mention the form factor at all → UNCERTAIN.
-  A product whose title confirms the correct form factor → PASS for that spec.
-  CRITICAL: Silence is NOT a pass for form-factor specs. A title saying "wireless
-  headphones" when the user asked for "over-ear" is UNCERTAIN, not PASS.
-
-DISQUALIFICATION RULE (absolute, no exceptions):
-  Any product with a FAIL verdict on ANY single HARD requirement is permanently
-  excluded from selection. Rating, price, and sales count are irrelevant — a
-  5.0-rated product with 1,000,000 sales is excluded if it fails one hard spec.
-
-UNCERTAIN fallback: Use UNCERTAIN products only if fewer than 3 PASS products
-exist. When a pick comes from the UNCERTAIN pool, set "spec_warning": true.
-
-── PHASE 3: RANKED SELECTION ─────────────────────────────
-From the compliant pool (PASS first, UNCERTAIN as fallback), apply the
-two-step process below before selecting the final 3.
-
-  STEP 3a — JUNK SCREEN (internal, not output):
-  For each product, estimate the minimum plausible price (USD) for a non-defective,
-  non-counterfeit version of this item from a legitimate AliExpress seller.
-  This is not the cheapest possible — this is the floor below which the item is
-  almost certainly: counterfeit, a placeholder listing, missing components, or
-  a rating-farmed item.
-
-  Flag a product as SUSPECTED_JUNK if ALL THREE are true:
-    1. price_usd is below your estimated plausibility floor for this category
-    2. No recognized brand name appears in the title
-    3. rating >= 4.8 (suspiciously high for a no-name item — consistent with
-       incentivized reviews and rating farming on AliExpress)
-
-  NOTE: A recognized-brand item priced below the floor is NOT junk — brands
-  run aggressive promotions. Brand presence alone removes the junk flag.
-
-  STEP 3b — INTENT-GATED JUNK HANDLING (uses QUALITY_INTENT from Phase 0):
-    PREMIUM  → SUSPECTED_JUNK items are fully disqualified. Treat them exactly
-               like FAIL items. Use UNCERTAIN-pool products before ever picking
-               a SUSPECTED_JUNK item.
-    STANDARD → SUSPECTED_JUNK items are excluded from the "best_rated" pick only.
-               May appear as "cheapest" if significantly the cheapest option, but
-               the Hebrew reason MUST include a quality caveat.
-    BUDGET   → SUSPECTED_JUNK items are allowed in all three picks. No penalty.
-
-  STEP 3c — FINAL SELECTION:
-  From the remaining qualified products, select:
-    "cheapest"   — lowest price_usd
-    "best_rated" — highest rating; tiebreaker: if two ratings are within 0.2
-                   stars, prefer the product with a recognized brand in the title
-                   (a 4.7 from a known brand beats a 4.8 from an unknown seller);
-                   use highest sales as final tiebreaker
-    "best_value" — best balance of price AND rating combined
-
-══════════════════════════════════════════════════════════
-ABSOLUTE OUTPUT RULES
-══════════════════════════════════════════════════════════
-1. You MUST only recommend products whose item_id appears in the provided list.
-2. You MUST NOT invent, modify, or assume any product title, price, or rating.
-3. Output MUST be a valid JSON array ONLY — no markdown fences, no prose.
-4. Return exactly 3 objects with categories "cheapest", "best_rated", "best_value".
-5. The "reason" field MUST be written in Hebrew (he-IL), 1–2 short sentences.
-6. Set "spec_warning": true only for picks from the UNCERTAIN pool.
-7. Set "spec_warning": false for all fully compliant PASS picks.
-8. Internal phase outputs (FORM_FACTOR_HARD_SPECS, QUALITY_INTENT, junk flags)
-   MUST NOT appear in the output JSON — they are internal reasoning only.
-
-Output schema (JSON array, nothing else):
-[
-  {"category": "cheapest",   "item_id": "<id>", "reason": "<Hebrew>", "spec_warning": false},
-  {"category": "best_rated", "item_id": "<id>", "reason": "<Hebrew>", "spec_warning": false},
-  {"category": "best_value", "item_id": "<id>", "reason": "<Hebrew>", "spec_warning": true}
-]"""
+_VALID_STRATEGIES: frozenset[str] = frozenset({
+    "COMMODITY", "BRAND_DRIVEN", "SPEC_CRITICAL",
+    "FIT_CRITICAL", "TRUST_DRIVEN", "AESTHETIC",
+})
 
 
-_CLARIFY_SYSTEM_PROMPT = """You are a smart shopping assistant for an Israeli AliExpress bot.
+# ── Clarification prompt ───────────────────────────────────────────────────────
 
-Analyze whether the given Hebrew product query is too broad/generic to return good, targeted results.
+_CLARIFY_SYSTEM_PROMPT = """\
+You are a shopping assistant for an Israeli AliExpress bot.
+Decide if the Hebrew query is too vague to return targeted results.
 
-GENERIC (needs clarification): single-word or vague queries — "תיק", "נעליים", "טלפון", "כיסא", "שמלה", "מנורה"
-SPECIFIC (no clarification needed): queries with attributes like model, size, color, material, use-case — "כיסוי עור לאייפון 15", "כיסא גיימינג ארגונומי אדום"
+VAGUE (needs clarification): bare noun with NO additional signals — \
+"תיק", "נעליים", "כיסא", "אוזניות", "שמלה", "מצלמה"
 
-If clarification is needed, return up to 4 short, friendly Hebrew questions tailored to that product category.
-Questions must help narrow down: use-case, size/spec, budget, or style preference.
+SPECIFIC (no clarification needed): query already contains ANY of the following signals — \
+  • Form-factor or physical constraint (over-ear, in-ear, L-shaped, foldable, standing, 3m)
+  • Technology type (TWS, ANC, Bluetooth, wireless, mechanical, GaN, 4K)
+  • Use-case activity (running, gaming, cycling, sleeping, hiking, office)
+  • Size or spec (100W, Size 47, DDR5, 12mm, IP68)
+  • IP / character / brand name (Ghibli, Spider-Man, Anker, iPhone 15)
+  • Color or style anchor (black, minimalist, aesthetic)
 
-Output schema (JSON object, nothing else):
+FORM-FACTOR LOCK — these combinations are irreversibly specific, never ask more:
+  running + earphones/earbuds → clearly in-ear TWS, do NOT ask in-ear vs over-ear
+  TWS + earbuds/earphones     → clearly in-ear, do NOT ask in-ear vs over-ear
+  ANC + running/sport         → clearly in-ear TWS
+  gaming + keyboard/mouse     → clearly desktop peripherals, do NOT ask use-case
+  wireless + any audio        → Bluetooth assumed, do NOT ask wired vs wireless
+
+If clarification IS needed, ask up to 3 short, friendly Hebrew questions targeting:
+use-case, physical spec/size, or budget. Never ask a question whose answer is already
+implied by the query.
+
+BRAND RULE — CRITICAL: NEVER mention Apple, Sony, Bose, Nike, LEGO, Adidas, Samsung, \
+or any Western/premium brand. Suggest only AE-native brands:
+  Audio: Baseus, Soundpeats, Tozo, QCY, Hifiman
+  Charging/cables: Anker, Ugreen, Baseus, Joyroom
+  Sports/footwear: Li-Ning, Naturehike, Anta
+  Smart home: Xiaomi, Gosund, Sonoff
+
+Output JSON only:
 {"needs_clarification": true,  "questions": ["שאלה 1?", "שאלה 2?"]}
-or
-{"needs_clarification": false, "questions": []}"""
+{"needs_clarification": false, "questions": []}\
+"""
 
-_REFINE_SYSTEM_PROMPT = """You are an expert AliExpress search query optimizer.
 
-Given a Hebrew product query and the user's answers to clarifying questions, produce the single most
-effective English search term for AliExpress. Combine all the context into one concise search string.
+# ── Refinement prompt ──────────────────────────────────────────────────────────
 
-Return ONLY the English search term — no explanation, no alternatives, no punctuation at the end."""
+_REFINE_SYSTEM_PROMPT = """\
+You are an AliExpress search optimizer. Given a Hebrew query and the user's answers to \
+clarifying questions, output a refined trust-first search plan.
 
+SPEC ANCHORING (ironclad): every physical constraint named in the answers MUST appear \
+verbatim in the brand_queries and category_query. No exceptions:
+  User said "over-ear" → brand_queries MUST contain "over-ear"; \
+    confidence_hints MUST contain "over-ear"
+  User said "100W" → brand_queries MUST contain "100W"; \
+    confidence_hints MUST contain "100w"
+  User said "in-ear" → confidence_hints MUST contain "in-ear"; \
+    brand_queries MUST NOT use "headphone" or "headset"
+
+FORM-FACTOR REPLACES GENERIC: when a spec narrows the category, drop the generic parent:
+  "headphones" + "over-ear" → "over-ear headset Royal Kludge"
+  "charger" + "100W" → "100W GaN charger Baseus"
+
+BUDGET EXTRACTION: if the user states a budget, extract the ILS amount as price_window_max_ils.
+  "under 100 NIS" / "בסביבות 100 שקל" / "לא יותר מ-150" → integer ILS value.
+  If uncertain or not mentioned → null.
+
+brand_queries: 2–3 brand-specific search strings reflecting the refined spec.
+category_query: brand-free broad refined search (2–4 words).
+confidence_hints: 3–8 lowercase keywords to match in titles.
+
+AE-native brand reference:
+  Audio: QCY, Soundpeats, Hifiman, OneOdio, Baseus
+  Cables: Ugreen, Baseus, Anker
+  Chargers: Baseus, Anker, Ugreen
+  Keyboards: Royal Kludge, Ajazz, Cidoo
+  Mouse: Redragon, Fantech, Dareu
+  Shoes: Li-Ning, Anta
+
+OUTPUT: JSON only — no prose, no markdown fences.
+{"brand_queries":["<brand+keywords>"],"category_query":"<2-4 words no brand>",\
+"price_window_max_ils":<int or null>,"confidence_hints":["<keyword>"]}
+
+EXAMPLES:
+Original: "אוזניות", Answers: "in-ear, budget 100 NIS" →
+{"brand_queries":["QCY in-ear TWS earbuds","Soundpeats in-ear TWS earbuds"],\
+"category_query":"in-ear TWS earbuds sport","price_window_max_ils":100,\
+"confidence_hints":["in-ear","earbuds","tws","inear"]}
+
+Original: "מקלדת", Answers: "mechanical, under 200 NIS" →
+{"brand_queries":["Royal Kludge mechanical keyboard","Ajazz mechanical keyboard"],\
+"category_query":"mechanical keyboard gaming","price_window_max_ils":200,\
+"confidence_hints":["mechanical","keyboard","rgb","switch"]}
+
+Original: "נעלי ריצה", Answers: "men size 44" →
+{"brand_queries":["Li-Ning running shoes men","Anta running shoes men size 44"],\
+"category_query":"running shoes men sport","price_window_max_ils":null,\
+"confidence_hints":["running","shoes","sport","men","sneakers"]}\
+"""
+
+
+# ── LLM selection prompt ───────────────────────────────────────────────────────
+
+_SELECT_SYSTEM_PROMPT = """\
+You are a product curation expert for an Israeli AliExpress shopping bot.
+Select exactly 3 products from the list below that best match the user's search.
+
+Each product line: ID | Score | ₪Price | ★Rating | Sales | Official | Title (truncated)
+The score (0–100) reflects price relevance, seller trust, and title match.
+
+Selection principles:
+1. DIVERSITY: choose products across different price tiers or quality levels — \
+   avoid picking 3 nearly identical items.
+2. RELEVANCE: the product must actually be what the user searched for.
+3. QUALITY: prefer higher scores, but a lower-scored item is acceptable \
+   if it serves a clearly different customer need (e.g., the budget option).
+
+For each selected product, write a short Hebrew reason (max 10 words) explaining why \
+it was selected. Focus on: price advantage, quality signal, or unique feature.
+
+Hallucination guard: ONLY use IDs from the list above. Do not invent IDs.
+
+Output JSON only — no prose, no markdown fences:
+{"selected": [{"id": "<id>", "reason_he": "<Hebrew reason>"},\
+{"id": "<id>", "reason_he": "<Hebrew reason>"},\
+{"id": "<id>", "reason_he": "<Hebrew reason>"}]}\
+"""
+
+
+# ── Exceptions ─────────────────────────────────────────────────────────────────
 
 class LLMError(Exception):
-    """Raised when the LLM evaluation step fails."""
+    """Raised when an LLM call fails."""
 
 
-def _prune_items(raw: dict) -> list[dict]:
-    """Extract essential fields from a raw item_search_2 API response.
+# ── RefinementResult dataclass ─────────────────────────────────────────────────
 
-    Produces a clean list suitable for both LLM prompting and final display.
-    Missing fields default to None rather than raising.
+@dataclass(frozen=True)
+class RefinementResult:
+    """Structured output from refine_query().
+
+    Attributes:
+        search_plan: Refined SearchPlan to be merged with the base translator plan.
+                     Contains brand_queries, category_query, price_window_ils
+                     (min=0 means keep base floor), and confidence_hints.
+    """
+    search_plan: SearchPlan
+
+
+# ── Gemini wrapper with 429 retry ──────────────────────────────────────────────
+
+async def _gemini_generate(
+    client: genai.Client,
+    contents: str,
+    system_instruction: str,
+    response_mime_type: str | None = "application/json",
+    max_retries: int = 3,
+) -> str:
+    """Call Gemini and return response text, retrying on rate-limit errors.
 
     Args:
-        raw: Raw JSON dict returned by aliexpress/client.py.
+        client: Authenticated genai.Client instance.
+        contents: The user message to send.
+        system_instruction: System prompt text.
+        response_mime_type: Optional MIME type constraint on the response.
+        max_retries: Maximum number of retry attempts on 429/resource-exhausted errors.
 
     Returns:
-        List of pruned product dicts with keys:
-        item_id, title, price_usd, rating, sales, image_url, product_url.
+        Stripped response text from the model.
+
+    Raises:
+        LLMError: After all retries are exhausted or on non-retryable errors.
+    """
+    config_kwargs: dict = {"system_instruction": system_instruction}
+    if response_mime_type:
+        config_kwargs["response_mime_type"] = response_mime_type
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = await client.aio.models.generate_content(
+                model=_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+            return response.text.strip()
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            is_rate_limit = (
+                "429" in exc_str
+                or "resource exhausted" in exc_str
+                or "quota" in exc_str
+            )
+            if is_rate_limit and attempt < max_retries:
+                wait = 2 ** attempt
+                logger.warning(
+                    "Gemini rate-limited (attempt %d/%d) — retrying in %ds.",
+                    attempt, max_retries, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise LLMError(
+                    f"Gemini call failed (attempt {attempt}/{max_retries}): {exc}"
+                ) from exc
+
+    raise LLMError("Gemini call failed: all retries exhausted.")
+
+
+# ── Module-level item helpers ──────────────────────────────────────────────────
+
+def _price(p: dict) -> float:
+    return float(p.get("price_ils") or 999)
+
+def _rating(p: dict) -> float:
+    return float(p.get("rating") or 0)
+
+def _sales(p: dict) -> int:
+    return int(p.get("sales") or 0)
+
+def _original_price(p: dict) -> float | None:
+    v = p.get("original_price_ils")
+    return float(v) if v is not None else None
+
+def _is_price_suspicious(p: dict) -> bool:
+    """Return True if price looks like a bait-and-switch cheap-variant price.
+
+    When the sale_price is less than 15% of the original_price, the listing
+    almost certainly shows the cheapest SKU while the user needs a specific
+    variant that costs much more.
+    """
+    orig = _original_price(p)
+    if orig is None or orig <= 0:
+        return False
+    return _price(p) / orig < 0.15
+
+def _effective_price(p: dict) -> float:
+    """Ranking price — inflated by 2.5× if the listing is a variant trap.
+
+    Inflated only for ranking/label assignment; display price is always price_ils.
+    """
+    base = _price(p)
+    return base * 2.5 if _is_price_suspicious(p) else base
+
+def _dedup_score(p: dict) -> float:
+    """Winner score for near-duplicate deduplication: rating × √sales."""
+    return _rating(p) * math.sqrt(max(_sales(p), 0))
+
+
+# ── Product deduplication ──────────────────────────────────────────────────────
+
+def _title_word_overlap(t1: str | None, t2: str | None) -> float:
+    """Fraction of words from the shorter title that appear in both titles."""
+    w1 = set((t1 or "").lower().split())
+    w2 = set((t2 or "").lower().split())
+    if not w1 or not w2:
+        return 0.0
+    return len(w1 & w2) / min(len(w1), len(w2))
+
+
+def _deduplicate_by_product(items: list[dict], search_strategy: str) -> list[dict]:
+    """Remove near-duplicate products (different sellers, same product).
+
+    Two items are considered duplicates when title word overlap > 75%.
+    Among duplicates, keep the item with the highest rating × √sales score.
+
+    Disabled for AESTHETIC: SEO keyword stuffing makes title overlap useless
+    for fashion/decor categories.
+
+    Args:
+        items: Pruned product list.
+        search_strategy: One of the _VALID_STRATEGIES constants.
+
+    Returns:
+        Deduplicated list, preserving input order for non-duplicate items.
+    """
+    if search_strategy == "AESTHETIC" or not items:
+        return items
+
+    kept: list[dict] = []
+    discarded_ids: set[str] = set()
+
+    for item in items:
+        item_id = item.get("item_id")
+        if item_id in discarded_ids:
+            continue
+
+        replaced = False
+        for i, kept_item in enumerate(kept):
+            if _title_word_overlap(item.get("title"), kept_item.get("title")) > 0.75:
+                if _dedup_score(item) > _dedup_score(kept_item):
+                    discarded_ids.add(kept_item.get("item_id"))
+                    kept[i] = item
+                else:
+                    discarded_ids.add(item_id)
+                replaced = True
+                break
+
+        if not replaced:
+            kept.append(item)
+
+    logger.info(
+        "_deduplicate_by_product: %d → %d items (strategy=%s).",
+        len(items), len(kept), search_strategy,
+    )
+    return kept
+
+
+# ── Pure-Python product pruner ─────────────────────────────────────────────────
+
+def _prune_items(raw: dict) -> list[dict]:
+    """Extract essential display fields from a normalized AliExpress API response.
+
+    Args:
+        raw: Normalized dict from aliexpress/client.py with result.resultList.
+
+    Returns:
+        List of product dicts: item_id, title, price_ils, original_price_ils,
+        rating, sales, is_official_store, image_url, product_url.
+        Missing fields default to None / False.
     """
     try:
         result_list: list = raw["result"]["resultList"]
-    except KeyError:
-        # resultList is absent — either an error envelope slipped through (client.py
-        # should have caught it) or a genuine structural change in the API.
-        logger.error(
-            "_prune_items: 'resultList' key missing. API status: %s",
-            raw.get("result", {}).get("status", {}).get("code"),
-        )
-        return []
-    except TypeError:
-        logger.error("_prune_items: unexpected API structure, top-level keys=%s", list(raw.keys()))
+    except (KeyError, TypeError):
+        logger.error("_prune_items: resultList missing. Keys: %s", list(raw.keys()))
         return []
 
     pruned: list[dict] = []
@@ -224,217 +392,501 @@ def _prune_items(raw: dict) -> list[dict]:
             continue
 
         raw_url: str = item.get("itemUrl") or ""
-        raw_img: str = item.get("image") or ""
+        raw_img: str = item.get("image")   or ""
+        sku_def: dict = (item.get("sku") or {}).get("def", {})
 
         pruned.append({
-            "item_id": item.get("itemId"),
-            "title": item.get("title"),
-            "price_usd": (item.get("sku") or {}).get("def", {}).get("promotionPrice"),
-            "rating": item.get("averageStarRate"),
-            "sales": item.get("sales"),
-            "image_url": ("https:" + raw_img) if raw_img.startswith("//") else raw_img,
-            "product_url": ("https:" + raw_url) if raw_url.startswith("//") else raw_url,
+            "item_id":            item.get("itemId"),
+            "title":              item.get("title"),
+            "price_ils":          sku_def.get("promotionPrice"),
+            "original_price_ils": sku_def.get("originalPrice"),
+            "rating":             item.get("averageStarRate"),
+            "sales":              item.get("sales"),
+            "is_official_store":  item.get("isOfficialStore", False),
+            "image_url":          ("https:" + raw_img) if raw_img.startswith("//") else raw_img,
+            "product_url":        ("https:" + raw_url) if raw_url.startswith("//") else raw_url,
         })
 
     return pruned
 
 
-def _parse_llm_json(text: str) -> list[dict]:
-    """Extract and parse a JSON array from an LLM response.
+# ── Confidence scoring ─────────────────────────────────────────────────────────
 
-    Strips markdown code fences if present, then finds the first complete
-    JSON array in the text.
+def _score_item(item: dict, search_plan: SearchPlan, strategy: str) -> dict:
+    """Compute a 4-component confidence score for a single product.
+
+    Components (total 0–100):
+      price_score    (0–30): price within search_plan.price_window_ils
+      seller_score   (0–30): official store + rating depth + sales depth
+      hint_score     (0–30): confidence_hints matched in product title
+      integrity_score (0–10): no zero price + no variant-trap bait
 
     Args:
-        text: Raw text output from the LLM.
+        item: Pruned product dict.
+        search_plan: SearchPlan from the translator (or merged with refinement).
+        strategy: Search strategy constant.
 
     Returns:
-        Parsed list of dicts.
-
-    Raises:
-        LLMError: If no valid JSON array can be extracted.
+        Dict with price_score, seller_score, hint_score, integrity_score, total.
     """
-    # Strip markdown fences defensively (```json ... ```)
-    text = re.sub(r"```(?:json)?\s*", "", text).strip()
+    price = _price(item)
+    p_min, p_max = search_plan.price_window_ils
 
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end <= start:
-        raise LLMError(f"No JSON array found in LLM response: {text[:300]!r}")
+    # ── price_score ────────────────────────────────────────────────────────────
+    if price <= 0:
+        price_score = 0
+    elif price < p_min:
+        # Below floor — suspicious cheap variant pricing
+        price_score = max(0, int(15 * price / p_min))
+    elif price <= p_max:
+        # Within the legitimate window — full score
+        price_score = 30
+    else:
+        # Above ceiling — decay proportionally; 0 at 3× ceiling
+        overage_ratio = (price - p_max) / (p_max * 2.0)
+        price_score = max(0, int(30 * (1.0 - overage_ratio)))
 
-    try:
-        return json.loads(text[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise LLMError(f"Failed to parse LLM JSON: {exc}. Raw: {text[:300]!r}") from exc
+    # ── seller_score ───────────────────────────────────────────────────────────
+    seller_score = 0
+    if item.get("is_official_store"):
+        seller_score += 15
+    rating = _rating(item)
+    if rating >= 4.5:
+        seller_score += 10
+    elif rating >= 4.0:
+        seller_score += 5
+    elif rating >= 3.5:
+        seller_score += 2
+    sales = _sales(item)
+    if sales >= 1000:
+        seller_score += 5
+    elif sales >= 500:
+        seller_score += 3
+    elif sales >= 100:
+        seller_score += 1
+    seller_score = min(30, seller_score)
+
+    # ── hint_score ─────────────────────────────────────────────────────────────
+    title_lower = (item.get("title") or "").lower()
+    hints = search_plan.confidence_hints
+    if hints:
+        matched = sum(1 for h in hints if h in title_lower)
+        hint_score = int(30 * matched / len(hints))
+    else:
+        hint_score = 15  # no hints = neutral
+
+    # ── integrity_score ────────────────────────────────────────────────────────
+    integrity_score = 0
+    if price > 0:
+        integrity_score += 5
+    if not _is_price_suspicious(item):
+        integrity_score += 5
+
+    total = price_score + seller_score + hint_score + integrity_score
+
+    return {
+        "price_score":     price_score,
+        "seller_score":    seller_score,
+        "hint_score":      hint_score,
+        "integrity_score": integrity_score,
+        "total":           total,
+    }
 
 
-def _apply_hallucination_guard(
-    picks: list[dict],
-    source_by_id: dict[str, dict],
+def _run_confidence_scoring(
+    items: list[dict],
+    search_plan: SearchPlan,
+    strategy: str,
 ) -> list[dict]:
-    """Discard any LLM pick whose item_id does not exist in the source data.
-
-    This is the core Hallucination Guard. It ensures no invented product ever
-    reaches the user, even if the LLM disobeys the prompt rules.
+    """Score all items and attach their score breakdown as item["_score"].
 
     Args:
-        picks: Parsed list of LLM-recommended picks.
-        source_by_id: Dict mapping item_id → pruned product dict.
+        items: Deduplicated pruned product list.
+        search_plan: SearchPlan for scoring.
+        strategy: Search strategy constant.
 
     Returns:
-        Filtered list containing only picks with verified item_ids.
+        Same list with "_score" dict attached to each item.
     """
-    validated: list[dict] = []
-    for pick in picks:
-        item_id = pick.get("item_id")
-        if not item_id or item_id not in source_by_id:
-            logger.warning(
-                "HALLUCINATION GUARD: discarding pick — item_id %r not in source data.", item_id
-            )
-            continue
-        validated.append(pick)
-    return validated
+    scored = []
+    for item in items:
+        score = _score_item(item, search_plan, strategy)
+        scored.append({**item, "_score": score})
+
+    scored.sort(key=lambda x: x["_score"]["total"], reverse=True)
+
+    logger.info(
+        "_run_confidence_scoring: %d items scored. Top score=%d, median=%d.",
+        len(scored),
+        scored[0]["_score"]["total"] if scored else 0,
+        scored[len(scored) // 2]["_score"]["total"] if scored else 0,
+    )
+    return scored
 
 
+# ── Debug logging ──────────────────────────────────────────────────────────────
 
-async def evaluate_products(raw_json: dict, user_query: str) -> list[dict]:
-    """Evaluate raw AliExpress search results and return the top 3 recommended products.
+def _write_debug_log(data: dict) -> None:
+    """Write a search debug log to logs/search_debug_<timestamp>.json.
 
-    Pipeline:
-      1. Prune raw JSON to essential fields.
-      2. Send pruned items to Gemini with a strict JSON-only prompt.
-      3. Parse the LLM response.
-      4. Apply the Hallucination Guard — discard any item_id not in source.
-      5. Merge validated picks with full source data (title, image, URL always from source).
+    Fails silently so that a logging error never interrupts the user response.
 
     Args:
-        raw_json: Raw JSON dict from search_aliexpress().
-        user_query: The original Hebrew query (used for LLM context).
+        data: Full debug payload: SearchPlan, all scored items, top-10, LLM output.
+    """
+    try:
+        log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(log_dir, f"search_debug_{ts}.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, default=str)
+        logger.debug("Debug log written: %s", path)
+    except Exception as exc:
+        logger.warning("Failed to write debug log: %s", exc)
+
+
+# ── LLM selection ──────────────────────────────────────────────────────────────
+
+async def _llm_select_products(
+    top_items: list[dict],
+    user_query: str,
+    search_plan: SearchPlan,
+    strategy: str,
+) -> list[dict]:
+    """Ask Gemini to select the best 3 product IDs from top_items.
+
+    Shows the pre-scored top items in a compact table and requests 3 ID picks
+    with Hebrew reasons. Falls back gracefully on LLM failure.
+
+    Args:
+        top_items: Up to 10 scored items (with "_score" attached).
+        user_query: Original Hebrew user query (context for the LLM).
+        search_plan: SearchPlan (for logging context).
+        strategy: Search strategy constant.
 
     Returns:
-        List of up to 3 dicts, each containing:
-        category, category_label, title, price_usd, rating, sales,
-        image_url, product_url, reason, spec_warning.
+        List of {"id": str, "reason_he": str} dicts. May be empty on failure.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.warning("_llm_select_products: GEMINI_API_KEY not set — skipping LLM selection.")
+        return []
+
+    lines = []
+    for item in top_items:
+        sc = item.get("_score", {})
+        is_off = "✓" if item.get("is_official_store") else "✗"
+        rating = f"{_rating(item):.1f}" if _rating(item) > 0 else "—"
+        title_trunc = (item.get("title") or "")[:90]
+        lines.append(
+            f'{item["item_id"]} | {sc.get("total",0):3d} | '
+            f'₪{_price(item):.0f} | {rating}★ | {_sales(item):,} | {is_off} | {title_trunc}'
+        )
+
+    product_table = "\n".join(lines)
+    hints_str = ", ".join(search_plan.confidence_hints) if search_plan.confidence_hints else "—"
+    contents = (
+        f'User searched for: "{user_query}"\n'
+        f"Strategy: {strategy} | Key signals: {hints_str}\n\n"
+        f"Pre-scored products (ID | Score | Price | Rating | Sales | Official | Title):\n"
+        f"{product_table}"
+    )
+
+    client = genai.Client(api_key=api_key)
+    try:
+        raw_text = await _gemini_generate(client, contents, _SELECT_SYSTEM_PROMPT)
+        clean = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
+        obj_start = clean.find("{")
+        obj_end   = clean.rfind("}")
+        if obj_start == -1 or obj_end == -1:
+            raise LLMError(f"No JSON in selection response: {raw_text[:200]!r}")
+        parsed = json.loads(clean[obj_start : obj_end + 1])
+        selected: list[dict] = parsed.get("selected", [])
+
+        logger.info(
+            "_llm_select_products: LLM returned %d selections for query %r.",
+            len(selected), user_query,
+        )
+        return selected
+
+    except Exception as exc:
+        logger.warning(
+            "_llm_select_products: LLM call failed (%s) — will fallback to top items.", exc
+        )
+        return []
+
+
+# ── Label assignment ───────────────────────────────────────────────────────────
+
+def _assign_labels_and_format(
+    items: list[dict],
+    strategy: str,
+) -> list[dict]:
+    """Assign cheapest/best_rated/best_value labels and format for display.
+
+    Labels are assigned purely by Python scoring of the LLM-selected items:
+      cheapest   — lowest _effective_price (variant-trap penalised)
+      best_rated — highest quality signal: (rating, sales)
+      best_value — the remaining item
+
+    Args:
+        items: 1–3 LLM-selected product dicts (with "_score" and "_llm_reason").
+        strategy: Search strategy constant (for Hebrew reason fallbacks).
+
+    Returns:
+        List of dicts formatted for _format_result_card() in handlers.py.
+    """
+    if not items:
+        return []
+
+    remaining = list(items)
+    results: list[dict] = []
+
+    def _pop_cheapest(pool: list[dict]) -> dict:
+        winner = min(pool, key=_effective_price)
+        pool.remove(winner)
+        return winner
+
+    def _pop_best_rated(pool: list[dict]) -> dict:
+        winner = max(pool, key=lambda p: (_rating(p), _sales(p)))
+        pool.remove(winner)
+        return winner
+
+    label_sequence = ["cheapest", "best_rated", "best_value"][:len(remaining)]
+
+    assigned: dict[str, dict] = {}
+    cheapest_item  = _pop_cheapest(remaining)
+    assigned["cheapest"] = cheapest_item
+
+    if remaining:
+        best_rated_item = _pop_best_rated(remaining)
+        assigned["best_rated"] = best_rated_item
+
+    if remaining:
+        assigned["best_value"] = remaining[0]
+
+    def _fallback_reason(category: str, p: dict) -> str:
+        if category == "cheapest":
+            return "המחיר הנמוך ביותר ברשימה"
+        if category == "best_rated":
+            r, s = _rating(p), _sales(p)
+            return f"דירוג {r:.1f}★ עם {s:,} הזמנות" if r > 0 else "הדירוג הגבוה ביותר ברשימה"
+        if p.get("is_official_store"):
+            return "חנות רשמית — האיזון הטוב ביותר בין מחיר לאמינות"
+        return "האיזון הטוב ביותר בין מחיר לדירוג"
+
+    for category in ["cheapest", "best_rated", "best_value"]:
+        pick = assigned.get(category)
+        if pick is None:
+            continue
+
+        llm_reason = (pick.get("_llm_reason") or "").strip()
+        reason = llm_reason if llm_reason else _fallback_reason(category, pick)
+
+        # Strip internal scoring keys before returning
+        clean_pick = {k: v for k, v in pick.items() if not k.startswith("_")}
+        results.append({
+            **clean_pick,
+            "category":        category,
+            "category_label":  _CATEGORY_LABELS[category],
+            "reason":          reason,
+            "spec_warning":    False,
+            "price_suspicious": _is_price_suspicious(pick),
+        })
+
+    logger.info(
+        "_assign_labels_and_format: assigned %d labels (strategy=%s).",
+        len(results), strategy,
+    )
+    return results
+
+
+# ── Main pipeline entry point ──────────────────────────────────────────────────
+
+async def select_and_rank_products(
+    raw_json: dict,
+    user_query: str,
+    search_plan: SearchPlan,
+    search_strategy: str = "BRAND_DRIVEN",
+) -> list[dict]:
+    """Full Trust-First pipeline: score → top-10 → LLM select → Python label.
+
+    Stages:
+      1. _prune_items()             — extract fields from raw API response
+      2. valid filter               — drop items with no price
+      3. _deduplicate_by_product()  — remove near-identical listings
+      4. _run_confidence_scoring()  — 4-component score per item
+      5. Top-N selection            — keep top _TOP_N_LLM by score
+      6. _llm_select_products()     — LLM picks _SELECT_COUNT IDs + Hebrew reasons
+      7. Hallucination guard        — validate returned IDs exist in pool
+      8. Fill fallback              — if LLM returns < 3 valid IDs, add top-scored
+      9. _assign_labels_and_format() — Python assigns labels by actual data
+     10. _write_debug_log()         — full score breakdown to logs/search_debug_*.json
+
+    Args:
+        raw_json:        Normalized dict from search_aliexpress_multi().
+        user_query:      Original Hebrew query (display + LLM context).
+        search_plan:     Trust-first SearchPlan (queries, price window, hints).
+        search_strategy: One of the _VALID_STRATEGIES constants.
+
+    Returns:
+        List of 1–3 product dicts formatted for _format_result_card().
 
     Raises:
-        LLMError: If the Groq call fails or no valid picks survive the guard.
+        LLMError: If no priceable products remain after pruning.
     """
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise LLMError("GROQ_API_KEY is not set in the environment.")
+    if search_strategy not in _VALID_STRATEGIES:
+        logger.warning(
+            "select_and_rank_products: unknown strategy %r — using BRAND_DRIVEN.", search_strategy
+        )
+        search_strategy = "BRAND_DRIVEN"
 
+    # ── 1. Prune ───────────────────────────────────────────────────────────────
     pruned = _prune_items(raw_json)
     if not pruned:
         raise LLMError("No products to evaluate after pruning.")
 
-    # Index by item_id for O(1) guard lookups and data merging.
-    source_by_id: dict[str, dict] = {
-        item["item_id"]: item for item in pruned if item.get("item_id")
-    }
-
-    # Trim to token budget: send only item_id, title, price, rating, sales.
-    llm_items = [
-        {
-            "item_id": p["item_id"],
-            "title": p["title"],
-            "price_usd": p["price_usd"],
-            "rating": p["rating"],
-            "sales": p["sales"],
-        }
-        for p in pruned[:_MAX_ITEMS_FOR_LLM]
+    # ── 2. Basic validity filter ───────────────────────────────────────────────
+    valid = [
+        p for p in pruned[:_MAX_ITEMS]
+        if p.get("item_id") and p.get("price_ils") is not None
+        and float(p.get("price_ils", 0)) > 0
     ]
+    if not valid:
+        raise LLMError("No results: no priceable products in the result set.")
 
-    user_message = (
-        f'User is looking for: "{user_query}"\n\n'
-        f"Product list:\n{json.dumps(llm_items, ensure_ascii=False, indent=2)}\n\n"
-        "Select the 3 best products following the rules in your instructions."
+    # ── 3. Deduplicate ─────────────────────────────────────────────────────────
+    deduped = _deduplicate_by_product(valid, search_strategy)
+
+    # ── 4. Score all ──────────────────────────────────────────────────────────
+    scored = _run_confidence_scoring(deduped, search_plan, search_strategy)
+
+    # ── 5. Top-N ──────────────────────────────────────────────────────────────
+    top_items = scored[:_TOP_N_LLM]
+
+    # ── 6. LLM selection ──────────────────────────────────────────────────────
+    llm_selections = await _llm_select_products(top_items, user_query, search_plan, search_strategy)
+
+    # ── 7. Hallucination guard ─────────────────────────────────────────────────
+    top_by_id = {p["item_id"]: p for p in top_items}
+    selected: list[dict] = []
+    for sel in llm_selections:
+        item_id = str(sel.get("id") or "").strip()
+        if item_id and item_id in top_by_id:
+            item = top_by_id[item_id].copy()
+            item["_llm_reason"] = (sel.get("reason_he") or "").strip()
+            selected.append(item)
+
+    # ── 8. Fallback fill ──────────────────────────────────────────────────────
+    if len(selected) < _SELECT_COUNT:
+        existing_ids = {p["item_id"] for p in selected}
+        for p in top_items:
+            if len(selected) >= _SELECT_COUNT:
+                break
+            if p["item_id"] not in existing_ids:
+                item = p.copy()
+                item["_llm_reason"] = ""
+                selected.append(item)
+                existing_ids.add(p["item_id"])
+
+    selected = selected[:_SELECT_COUNT]
+
+    if not selected:
+        raise LLMError("No valid products could be selected from the result set.")
+
+    # ── 9. Label assignment ────────────────────────────────────────────────────
+    results = _assign_labels_and_format(selected, search_strategy)
+
+    # ── 10. Debug log ─────────────────────────────────────────────────────────
+    _write_debug_log({
+        "user_query":      user_query,
+        "search_strategy": search_strategy,
+        "search_plan": {
+            "brand_queries":    list(search_plan.brand_queries),
+            "category_query":   search_plan.category_query,
+            "price_window_ils": list(search_plan.price_window_ils),
+            "confidence_hints": list(search_plan.confidence_hints),
+        },
+        "total_fetched":   len(pruned),
+        "valid_count":     len(valid),
+        "deduped_count":   len(deduped),
+        "all_scored": [
+            {
+                "item_id":          p["item_id"],
+                "title":            (p.get("title") or "")[:80],
+                "price_ils":        p.get("price_ils"),
+                "rating":           p.get("rating"),
+                "sales":            p.get("sales"),
+                "is_official_store": p.get("is_official_store"),
+                "score":            p.get("_score", {}),
+            }
+            for p in scored
+        ],
+        "top_10_sent_to_llm": [
+            {
+                "item_id":   p["item_id"],
+                "title":     (p.get("title") or "")[:80],
+                "price_ils": p.get("price_ils"),
+                "score":     p.get("_score", {}),
+            }
+            for p in top_items
+        ],
+        "llm_raw_selections": llm_selections,
+        "final_output": [
+            {
+                "item_id":        r["item_id"],
+                "category":       r["category"],
+                "title":          (r.get("title") or "")[:80],
+                "price_ils":      r.get("price_ils"),
+                "reason":         r.get("reason"),
+                "price_suspicious": r.get("price_suspicious"),
+            }
+            for r in results
+        ],
+    })
+
+    logger.info(
+        "select_and_rank_products: selected %d products (strategy=%s).",
+        len(results), search_strategy,
     )
-
-    client = AsyncGroq(api_key=api_key)
-    logger.info("Sending %d products to LLM for evaluation.", len(llm_items))
-    try:
-        response = await client.chat.completions.create(
-            model=_MODEL,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            response_format={"type": "json_object"},
-        )
-        raw_text = response.choices[0].message.content.strip()
-    except Exception as exc:
-        raise LLMError(f"Groq evaluation call failed: {exc}") from exc
-
-    picks = _parse_llm_json(raw_text)
-    validated = _apply_hallucination_guard(picks, source_by_id)
-
-    if not validated:
-        raise LLMError("All LLM picks were discarded by the Hallucination Guard.")
-
-    # Merge: LLM provides category + reason + spec_warning; source provides all product data.
-    # spec_warning flags picks from the UNCERTAIN pool — the LLM could not verify all hard specs.
-    results: list[dict] = []
-    for pick in validated:
-        source = source_by_id[pick["item_id"]]
-        results.append({
-            "category": pick.get("category", ""),
-            "category_label": CATEGORY_LABELS.get(pick.get("category", ""), ""),
-            "title": source["title"],
-            "price_usd": source["price_usd"],
-            "rating": source["rating"],
-            "sales": source["sales"],
-            "image_url": source["image_url"],
-            "product_url": source["product_url"],
-            "reason": pick.get("reason", ""),
-            "spec_warning": bool(pick.get("spec_warning", False)),
-        })
-
-    logger.info("LLM evaluation complete: %d valid picks returned.", len(results))
     return results
 
 
+# ── Clarification helpers ──────────────────────────────────────────────────────
+
 async def should_clarify_query(query: str) -> dict:
-    """Decide whether a Hebrew query is too broad and needs clarifying questions.
+    """Decide whether a Hebrew query needs clarifying questions before searching.
 
     Args:
-        query: The raw Hebrew product query from the user.
+        query: Raw Hebrew product query from the user.
 
     Returns:
-        Dict with keys:
-          - needs_clarification (bool)
-          - questions (list[str]) — Hebrew questions, empty if no clarification needed.
+        {"needs_clarification": bool, "questions": list[str]}
 
     Raises:
-        LLMError: If the Groq call fails.
+        LLMError: If the Gemini call fails.
     """
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise LLMError("GROQ_API_KEY is not set in the environment.")
+        raise LLMError("GEMINI_API_KEY is not set in the environment.")
 
-    client = AsyncGroq(api_key=api_key)
-    try:
-        response = await client.chat.completions.create(
-            model=_MODEL,
-            messages=[
-                {"role": "system", "content": _CLARIFY_SYSTEM_PROMPT},
-                {"role": "user", "content": query},
-            ],
-            response_format={"type": "json_object"},
-        )
-        raw_text = response.choices[0].message.content.strip()
-    except Exception as exc:
-        raise LLMError(f"Groq clarification check failed: {exc}") from exc
+    client = genai.Client(api_key=api_key)
+    raw_text = await _gemini_generate(client, query, _CLARIFY_SYSTEM_PROMPT)
 
     try:
-        clean = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
+        clean  = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
         result: dict = json.loads(clean)
     except json.JSONDecodeError as exc:
-        raise LLMError(f"Failed to parse clarification JSON: {exc}. Raw: {raw_text[:200]!r}") from exc
+        raise LLMError(
+            f"Clarification JSON parse failed: {exc}. Raw: {raw_text[:200]!r}"
+        ) from exc
 
-    # Normalize and cap to 4 questions.
-    needs = bool(result.get("needs_clarification", False))
-    questions: list[str] = result.get("questions", [])[:4]
-    logger.info("Clarification check for %r: needs=%s, questions=%d", query, needs, len(questions))
+    needs     = bool(result.get("needs_clarification", False))
+    questions: list[str] = result.get("questions", [])[:3]
+    logger.info(
+        "Clarification check for %r: needs=%s, %d questions", query, needs, len(questions)
+    )
     return {"needs_clarification": needs, "questions": questions}
 
 
@@ -442,26 +894,30 @@ async def refine_query(
     original_query: str,
     questions: list[str],
     answers: list[str],
-) -> str:
-    """Merge a Hebrew query + user answers into an optimized English AliExpress search term.
+) -> RefinementResult:
+    """Merge a Hebrew query + clarification answers into a RefinementResult.
 
-    Combines translation and refinement in a single LLM call, using the
-    clarification Q&A as additional context to produce a more targeted query.
+    Returns a refined SearchPlan to be merged with the base translator plan
+    via merge_search_plans(). The refined plan contains:
+      - brand_queries: spec-anchored brand search strings
+      - category_query: refined broad query
+      - price_window_ils: (0, budget) if user stated a budget; (0, 0) if none
+      - confidence_hints: from the user's answers
 
     Args:
         original_query: The original Hebrew product query.
-        questions: The Hebrew clarifying questions that were asked.
+        questions: Hebrew clarifying questions that were asked.
         answers: The user's answers, aligned by index with questions.
 
     Returns:
-        An optimized English search term for AliExpress.
+        RefinementResult(search_plan)
 
     Raises:
-        LLMError: If the Groq call fails.
+        LLMError: If the Gemini call fails or returns an empty/unparseable response.
     """
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise LLMError("GROQ_API_KEY is not set in the environment.")
+        raise LLMError("GEMINI_API_KEY is not set in the environment.")
 
     qa_lines = "\n".join(
         f"  Q: {q}\n  A: {a}"
@@ -470,24 +926,57 @@ async def refine_query(
     )
     user_message = (
         f"Original query (Hebrew): {original_query}\n\n"
-        f"User's clarifying answers:\n{qa_lines or '(none)'}"
+        f"Clarifying answers:\n{qa_lines or '(none)'}"
     )
 
-    client = AsyncGroq(api_key=api_key)
+    client = genai.Client(api_key=api_key)
+    raw_text = await _gemini_generate(client, user_message, _REFINE_SYSTEM_PROMPT)
+
+    if not raw_text:
+        raise LLMError("Gemini returned an empty refined query.")
+
+    clean     = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
+    obj_start = clean.find("{")
+    obj_end   = clean.rfind("}")
+    if obj_start == -1 or obj_end == -1 or obj_end <= obj_start:
+        raise LLMError(f"No JSON object in refinement response. Raw: {raw_text[:200]!r}")
+
     try:
-        response = await client.chat.completions.create(
-            model=_MODEL,
-            messages=[
-                {"role": "system", "content": _REFINE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-        )
-        refined = response.choices[0].message.content.strip()
-    except Exception as exc:
-        raise LLMError(f"Groq query refinement failed: {exc}") from exc
+        parsed: dict = json.loads(clean[obj_start : obj_end + 1])
+    except json.JSONDecodeError as exc:
+        raise LLMError(
+            f"Refinement JSON parse failed: {exc}. Raw: {raw_text[:200]!r}"
+        ) from exc
 
-    if not refined:
-        raise LLMError("Groq returned an empty refined query.")
+    brand_queries = tuple(
+        str(q).strip() for q in (parsed.get("brand_queries") or [])[:3]
+        if q and str(q).strip()
+    )
+    category_query: str = (parsed.get("category_query") or "").strip()
 
-    logger.info("Refined query for %r → %r", original_query, refined)
-    return refined
+    # Budget cap — becomes the price_window max in merge_search_plans
+    try:
+        raw_max      = parsed.get("price_window_max_ils")
+        max_price    = int(raw_max) if raw_max is not None else 0
+    except (ValueError, TypeError):
+        max_price = 0
+
+    confidence_hints = tuple(
+        str(h).strip().lower() for h in (parsed.get("confidence_hints") or [])[:8]
+        if h and str(h).strip()
+    )
+
+    refined_plan = SearchPlan(
+        brand_queries=brand_queries,
+        category_query=category_query,
+        price_window_ils=(0, max_price),   # 0 min → merge keeps base floor
+        confidence_hints=confidence_hints,
+    )
+
+    logger.info(
+        "Refined plan for %r: brands=%d category=%r max_price=₪%s hints=%d",
+        original_query, len(brand_queries), category_query,
+        str(max_price) if max_price else "—",
+        len(confidence_hints),
+    )
+    return RefinementResult(search_plan=refined_plan)

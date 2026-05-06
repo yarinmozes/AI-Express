@@ -15,6 +15,7 @@ SEARCHING = "🔍 מחפש עבורך: {query}..."
 SEARCHING_TRANSLATING = "🌐 מתרגם את השאילתה..."
 SEARCHING_ALIEXPRESS = "📦 מחפש מוצרים ב-AliExpress..."
 SEARCHING_AI = "🤖 AI מנתח את התוצאות עבורך..."
+SEARCHING_FILTERING = "🎯 מסנן תוצאות רלוונטיות..."
 
 # Results header — {query} is the original Hebrew query.
 RESULTS_HEADER = '🔍 תוצאות עבור: "<b>{query}</b>"\n\n'
@@ -23,7 +24,7 @@ RESULTS_HEADER = '🔍 תוצאות עבור: "<b>{query}</b>"\n\n'
 RESULT_CARD = (
     "{label}\n"
     "<b>{title}</b>\n"
-    "💵 ${price}  |  ⭐ {rating}\n"
+    "💵 ₪{price}  |  ⭐ {rating}  |  📦 {sales} הזמנות\n"
     "<i>{reason}</i>\n"
     '🛒 <a href="{link}">לרכישה ב-AliExpress</a>'
 )
@@ -31,7 +32,7 @@ RESULT_CARD = (
 RESULT_CARD_NO_RATING = (
     "{label}\n"
     "<b>{title}</b>\n"
-    "💵 ${price}\n"
+    "💵 ₪{price}  |  📦 {sales} הזמנות\n"
     "<i>{reason}</i>\n"
     '🛒 <a href="{link}">לרכישה ב-AliExpress</a>'
 )
@@ -64,6 +65,13 @@ CLARIFICATION_SKIPPED = "🔍 מחפש עם השאילתה המקורית..."
 SPEC_WARNING = (
     "⚠️ <i>לא ניתן היה לאמת את כל המפרטים הטכניים מכותרת המוצר — "
     "אנא בדוק את דף המוצר לפני הרכישה.</i>"
+)
+
+# Appended when the listed price is suspiciously low relative to the original price,
+# indicating this may be a multi-variant listing showing the cheapest SKU price.
+PRICE_SUSPICIOUS_WARNING = (
+    "💡 <i>המחיר המוצג עשוי להיות עבור וריאנט ספציפי (גודל / אורך / צבע). "
+    "אמת את המחיר הסופי לפני הרכישה.</i>"
 )
 
 # --- Errors ---

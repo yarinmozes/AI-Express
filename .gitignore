@@ -1,1 +1,15 @@
 .claude/
+
+# secrets
+.env
+*.env
+!.env.example
+
+# logs
+AliExpress-Affiliate-Bot/logs/
+*.log
+
+# local notes / stray files
+/.txt
+AliExpress-Affiliate-Bot/AliExpress Full API Documentation.txt
+AliExpress-Affiliate-Bot/how to start.txt
